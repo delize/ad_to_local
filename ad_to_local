@@ -1,0 +1,269 @@
+#!/usr/bin/env bash
+# Modified 2018/5/2
+Version=1.4
+# Original source is from MigrateUserHomeToDomainAcct.sh
+# Written by Patrick Gallagher - https://twitter.com/patgmac
+#
+# Guidance and inspiration from Lisa Davies:
+# http://lisacherie.com/?p=239
+#
+# Modified by Rich Trouton
+# https://github.com/rtrouton/rtrouton_scripts
+#
+# Version 1.0 - Migrates an Active Directory mobile account to a local account by the following process:
+# 1. Detect if the Mac is bound to AD and offer to unbind the Mac from AD if desired
+# 2. Display a list of the accounts with a UID greater than 1000
+# 3. Once an account is selected, back up the password hash of the account from the AuthenticationAuthority attribute
+# 4. Remove the following attributes from the specified account:
+#
+# cached_groups
+# cached_auth_policy
+# CopyTimestamp - This attribute is used by the OS to determine if the account is a mobile account
+# SMBPrimaryGroupSID
+# OriginalAuthenticationAuthority
+# OriginalNodeName
+# AuthenticationAuthority
+# SMBSID
+# SMBScriptPath
+# SMBPasswordLastSet
+# SMBGroupRID
+# PrimaryNTDomain
+# AppleMetaRecordName
+# MCXSettings
+# MCXFlags
+#
+# 5. Recreate the AuthenticationAuthority attribute and restore the password hash of the account from backup
+# 6. Restart the directory services process
+# 7. Check to see if the conversion process succeeded by checking the OriginalNodeName attribute for the value "Active Directory"
+# 8. If the conversion process succeeded, update the permissions on the account's home folder.
+# 9. Prompt if admin rights should be granted for the specified account
+#
+# Version 1.1
+#
+# Changes:
+#
+# 1. After conversion, the specified account is added to the staff group.  All local accounts on this Mac are members of the staff group,
+#    but AD mobile accounts are not members of the staff group.
+# 2. The "accounttype" variable is now checking the AuthenticationAuthority attribute instead of the OriginalNodeName attribute.
+#    The reason for Change 2's attributes change is that the AuthenticationAuthority attribute will exist following the conversion
+#    process while the OriginalNodeName attribute may not.
+#
+#
+# Version 1.2
+#
+# Changes:
+#
+# Add RemoveAD function to handle the following tasks:
+#
+# 1. Force unbind the Mac from Active Directory
+# 2. Deletes the Active Directory domain from the custom /Search and /Search/Contacts paths
+# 3. Changes the /Search and /Search/Contacts path type from Custom to Automatic
+#
+# Thanks to Rick Lemmon for the suggested changes to the AD unbind process.
+#
+#
+set -x
+set -o nounset
+
+
+RunAsRoot()
+{
+        #NOTE: Pass in the full path to the executable as $1
+        if [[ "${USER}" != "root" ]] ; then
+                echo ""
+                echo "***  This application must be run as root.  Please authenticate below.  ***"
+                echo ""
+                sudo "${1}" && exit 0
+        fi
+}
+
+RemoveAD(){
+    #NOTE: This function force-unbinds the Mac from the existing Active Directory domain
+    # and updates the search path settings to remove references to Active Directory
+    searchPath=$($dscl /Search -read . CSPSearchPath | grep Active\ Directory | sed 's/^[[:space:]]//')
+
+    #NOTE: Force unbind from Active Directory
+    $dsconfigad -remove -force -u none -p none
+
+    #NOTE: Deletes the Active Directory domain from the custom /Search
+    # and /Search/Contacts paths
+    $dscl /Search/Contacts -delete . CSPSearchPath "$searchPath"
+    $dscl /Search -delete . CSPSearchPath "$searchPath"
+
+    #NOTE: Changes the /Search and /Search/Contacts path type from Custom to Automatic
+    $dscl /Search -change . SearchPolicy dsAttrTypeStandard:CSPSearchPath dsAttrTypeStandard:NSPSearchPath
+    $dscl /Search/Contacts -change . SearchPolicy dsAttrTypeStandard:CSPSearchPath dsAttrTypeStandard:NSPSearchPath
+}
+
+append_path() {
+    if [[ -d "$1" ]]; then
+        PATH=$PATH:$1
+        echo "Path $1 added to PATH env, continuing"
+    else
+        echo "Path $1 does not exist. Continue on young jedi."
+    fi
+}
+
+check_cmd() {
+    if [[ -z "$1" ]]; then
+        (>&2 echo "$1 does not exist, exiting and not applying package")
+        exit 1
+    else
+        echo "$1 exists, continuing."
+    fi
+}
+
+append_path "/opt/puppetlabs/bin/"
+append_path "/usr/local/bin/"
+append_path "/opt/puppet/bin"
+echo "$PATH"
+
+facter=$(command -v facter)
+check_cmd "$facter"
+
+dscl=$(command -v dscl)
+check_cmd "$dscl"
+
+dsconfigad=$(command -v dsconfigad)
+check_cmd "$dsconfigad"
+
+dseditgroup=$(command -v dseditgroup)
+check_cmd "$dseditgroup"
+
+if ! $facter fqdn
+then
+    (>&2 echo "Facter failed to run the fqdn fact, please verify facter installation")
+    exit 2
+fi
+
+listUsers="$($dscl . list /Users UniqueID | grep -v administrator | grep -v _ | grep -v root | awk '$2 > 1000 {print $1}')"
+
+echo "List of users to be converted:"
+echo "$listUsers"
+
+FullScriptName=$(basename "$0")
+check4AD=$($dscl localhost -list . | grep "Active Directory")
+
+osvers=$(sw_vers -productVersion | awk -F. '{print $2}')
+
+echo "********* Running $FullScriptName Version $Version *********"
+#NOTE: Check for AD binding and offer to unbind if found.
+if [[ "${check4AD}" = "Active Directory" ]]; then
+	echo "This machine is bound to Active Directory. Removing AD Bind"
+    RemoveAD
+else
+	echo "Active Directory binding is still active or machine is not bound";
+fi
+
+echo "Processing accounts in user list:" >&2
+for netname in $listUsers; do
+  accounttype=$($dscl . -read /Users/"$netname" AuthenticationAuthority | head -2 | awk -F'/' '{print $2}' | tr -d '\n')
+
+  # We won't ever abort and not migrate so it's safe to add the user to
+  # staff before going through the migration process
+  if [[ ! "$(id "$netname")" = *"staff"* ]]; then
+      echo "Adding $netname to the staff group on this Mac."
+      $dseditgroup -o edit -a "$netname" -t user staff
+  fi
+
+  if [[ "$accounttype" = "Active Directory" ]]; then
+      mobileusercheck=$($dscl . -read /Users/"$netname" AuthenticationAuthority | head -2 | awk -F'/' '{print $1}' | tr -d '\n' | sed 's/^[^:]*: //' | sed s/\;/""/g)
+      if [[ "$mobileusercheck" = "LocalCachedUser" ]]; then
+          echo "$netname has an AD mobile account"
+          echo "Converting to a local account with the same username and UID"
+      else
+          echo "The $netname account is not a AD mobile account"
+          continue
+      fi
+  else
+      echo "The $netname account is not a AD mobile account"
+      continue
+  fi
+
+  echo "Displaying user and group information for the $netname account:"
+  echo "$netname's group memberships: $(id "$netname")"
+  id "$netname" >> /var/local/ad_to_local/id_output_for_ad_to_local_changes.log
+  adgid=$(id -g "$netname")
+  # Based on Nikolay's great tradegy, we play it safe here
+  if [ "$adgid" -eq 0 ]; then
+      echo "adgid is set to 0, aborting..."
+      exit 1
+  fi
+
+  # This will only work with the IT setup version of puppet/facter
+  netgroup=$($facter owner_is_administrator | head -1)
+
+  echo "Granting $netname account admin rights based on user's role-*"
+  #NOTE: grants user access based on if custom fact is installed.
+  if [[ "$netgroup" = "True" ]]; then
+      $dseditgroup -o edit -a "$netname" -t user admin
+      echo "Admin rights given to this account"
+  else
+      echo "No admin rights given based on custom fact"
+  fi
+
+  #NOTE: Preserve the account password by backing up password hash
+  shadowhash=$($dscl . -read /Users/"$netname" AuthenticationAuthority | grep " ;ShadowHash;HASHLIST:<"| sed 's/^[[:space:]]//')
+
+  #NOTE: Remove the account attributes that identify it as an Active Directory mobile account
+  $dscl . -delete /users/"$netname" cached_groups
+  $dscl . -delete /users/"$netname" cached_auth_policy
+  $dscl . -delete /users/"$netname" CopyTimestamp
+  $dscl . -delete /users/"$netname" AltSecurityIdentities
+  $dscl . -delete /users/"$netname" SMBPrimaryGroupSID
+  $dscl . -delete /users/"$netname" OriginalAuthenticationAuthority
+  $dscl . -delete /users/"$netname" OriginalNodeName
+  $dscl . -delete /users/"$netname" AuthenticationAuthority
+  $dscl . -create /users/"$netname" AuthenticationAuthority \'"$shadowhash"\'
+  $dscl . -delete /users/"$netname" SMBSID
+  $dscl . -delete /users/"$netname" SMBScriptPath
+  $dscl . -delete /users/"$netname" SMBPasswordLastSet
+  $dscl . -delete /users/"$netname" SMBGroupRID
+  $dscl . -delete /users/"$netname" PrimaryNTDomain
+  $dscl . -delete /users/"$netname" AppleMetaRecordName
+  $dscl . -delete /users/"$netname" MCXSettings
+  $dscl . -delete /users/"$netname" MCXFlags
+
+  #NOTE: Refresh Directory Services
+  if [[ ${osvers} -ge 7 ]]; then
+      /usr/bin/killall opendirectoryd
+  else
+      /usr/bin/killall DirectoryService
+  fi
+
+  sleep 20
+
+  accounttype=$($dscl . -read /Users/"$netname" AuthenticationAuthority | head -2 | awk -F'/' '{print $2}' | tr -d '\n')
+  if [[ "$accounttype" = "Active Directory" ]]; then
+      echo "Something went wrong with the conversion process"
+      echo "The $netname account is still an AD mobile account"
+      exit 1
+  else
+      echo "Conversion process was successful"
+      echo "The $netname account is now a local account"
+  fi
+
+  homedir=$($dscl . -read /Users/"$netname" NFSHomeDirectory  | awk '{print $2}')
+  if [[ ! -z "$homedir" ]]; then
+      echo "Home directory location: $homedir"
+      echo "Updating home folder permissions for the $netname account"
+      # Running chown -R $netname:staff $homedir could potentially messup
+      # someone's stuff is they have files that are owned by other
+      # users/groups. Example: developer who stores mysql/psql within his home
+      find "$homedir" -print0 | xargs -0 ls -l > /var/local/ad_to_local/"$netname"_homedir_files.log
+      chown -R "$netname":staff "$homedir"
+  fi
+
+  # Set the user's PrimaryGroupID to staff (20)
+  $dscl . -change /Users/"$netname" PrimaryGroupID "$adgid" 20
+
+  # this may take a long time
+  echo "Scanning the fs and changing group ownership..."
+  # echo should -n1 be used with xargs?
+  find / -path /Volumes -prune -o -gid "$adgid" -print0 | xargs -0 chgrp staff
+
+  echo "Transition from Active Directory to local user complete."
+
+  set +x
+  set +o nounset
+done
